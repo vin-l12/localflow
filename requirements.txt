@@ -1,0 +1,3 @@
+parakeet-mlx
+sounddevice
+pynput
