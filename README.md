@@ -13,16 +13,20 @@ speech model running on this Mac's GPU.
 
 ```
 hold Right-Option ──► mic capture (sounddevice, 16 kHz mono)
-release           ──► Parakeet TDT 0.6B on Apple MLX (Metal GPU, on-device)
+release           ──► Whisper large-v3-turbo on Apple MLX (Metal GPU, on-device)
                   ──► custom dictionary fix-ups (dictionary.json)
                   ──► clipboard + synthetic Cmd-V into the frontmost app
                         (old clipboard restored afterwards)
 ```
 
-- **Model**: `mlx-community/parakeet-tdt-0.6b-v2` — NVIDIA Parakeet, the same
-  family the good offline dictation apps use. Punctuates, capitalises, and
-  formats numbers ("four hundred dollars" → `$400`). ~1 s warm latency on the
-  M2 Pro, ~1.2 GB on disk, downloaded once then loaded with `HF_HUB_OFFLINE=1`.
+- **Model**: `mlx-community/whisper-large-v3-turbo` — OpenAI's Whisper
+  large-v3-turbo, ~1.6 GB on disk, downloaded once then loaded with
+  `HF_HUB_OFFLINE=1`. Punctuates, capitalises, and formats numbers
+  ("four hundred dollars" → `$400`). The previous engine, NVIDIA Parakeet
+  TDT 0.6B (`AB_MODEL` in the config block), is kept around for comparisons:
+  `./localflow.py --ab file.wav` transcribes with both and prints both, and
+  `./localflow.py --record file.wav` records a mic sample to compare on.
+  Setting `MODEL` back to the Parakeet id swaps the engine.
 - **Mic is only open while the key is held** — no always-on orange dot.
 - Transcription runs on a worker thread, so you can start the next dictation
   while the last one is still processing.
@@ -39,7 +43,7 @@ git clone https://github.com/vin-l12/localflow && cd localflow
 ./LocalFlow.command      # or double-click it in Finder
 ```
 
-First launch creates the environment, downloads the model (~1.2 GB, once),
+First launch creates the environment, downloads the model (~1.6 GB, once),
 then says `ready`. After that it's fully offline. macOS will ask for three
 permissions, granted to **your terminal app** (Terminal/iTerm/etc):
 

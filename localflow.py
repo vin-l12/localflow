@@ -7,8 +7,10 @@ Your words are transcribed on-device and pasted into whatever app has focus.
 No audio ever leaves this machine.
 
 Usage:
-    ./localflow.py                 run the dictation daemon
-    ./localflow.py --test FILE.wav transcribe a wav file and print (no paste)
+    ./localflow.py                   run the dictation daemon
+    ./localflow.py --test FILE.wav   transcribe a wav file and print (no paste)
+    ./localflow.py --ab FILE.wav     transcribe with BOTH engines and print both
+    ./localflow.py --record FILE.wav record mic until Enter, save a 16 kHz wav
 """
 
 import json
@@ -22,7 +24,8 @@ from pathlib import Path
 
 # ---------------------------------------------------------------- config ---
 HOTKEY = "alt_r"            # pynput key name: alt_r, cmd_r, ctrl_r, f13 ...
-MODEL = "mlx-community/parakeet-tdt-0.6b-v2"
+MODEL = "mlx-community/whisper-large-v3-turbo"    # live engine
+AB_MODEL = "mlx-community/parakeet-tdt-0.6b-v2"   # second engine for --ab
 SAMPLE_RATE = 16000
 MIN_SECONDS = 0.3           # ignore accidental taps shorter than this
 SOUNDS = True               # subtle audio cue on record start/stop
@@ -36,20 +39,40 @@ import numpy as np
 import sounddevice as sd
 
 
-def load_model():
-    """Load Parakeet. If the model is already on disk, force offline mode
-    BEFORE the library is imported (it reads the flag at import time), so
-    startup never touches the network."""
+def ensure_offline(*models):
+    """If every model we're about to load is already on disk, force offline
+    mode BEFORE the hub library is imported (it reads the flag at import
+    time), so startup never touches the network."""
     import os
 
-    cache = Path.home() / ".cache/huggingface/hub" / ("models--" + MODEL.replace("/", "--"))
-    if cache.is_dir():
+    hub = Path.home() / ".cache/huggingface/hub"
+    if all((hub / ("models--" + m.replace("/", "--"))).is_dir() for m in models):
         os.environ["HF_HUB_OFFLINE"] = "1"
     else:
-        print("model not cached yet — downloading once (~1.2 GB) ...")
+        print("model not cached yet — downloading once ...")
 
-    from parakeet_mlx import from_pretrained
-    return from_pretrained(MODEL)
+
+def load_engine(model):
+    """Return a transcribe(float32 16 kHz audio) -> str function."""
+    if "whisper" in model:
+        import mlx_whisper
+
+        def transcribe(audio):
+            return mlx_whisper.transcribe(
+                audio, path_or_hf_repo=model, fp16=True,
+            )["text"].strip()
+    else:  # parakeet
+        import mlx.core as mx
+        from parakeet_mlx import from_pretrained
+        from parakeet_mlx.audio import get_logmel
+
+        m = from_pretrained(model)
+
+        def transcribe(audio):
+            mel = get_logmel(mx.array(audio), m.preprocessor_config)
+            return m.generate(mel)[0].text.strip()
+
+    return transcribe
 
 
 def load_dictionary():
@@ -132,21 +155,15 @@ class Recorder:
 
 
 class LocalFlow:
-    def __init__(self):
-        print("localflow · loading model ...")
-        self.model = load_model()
+    def __init__(self, model=MODEL):
+        print(f"localflow · loading {model} ...")
+        ensure_offline(model)
+        self.transcribe = load_engine(model)
         self.rules = load_dictionary()
         self.recorder = Recorder()
         self.recording = False
         self.jobs = queue.Queue()
         threading.Thread(target=self.worker, daemon=True).start()
-
-    def transcribe(self, audio):
-        import mlx.core as mx
-        from parakeet_mlx.audio import get_logmel
-
-        mel = get_logmel(mx.array(audio), self.model.preprocessor_config)
-        return self.model.generate(mel)[0].text.strip()
 
     def worker(self):
         while True:
@@ -189,16 +206,45 @@ class LocalFlow:
             listener.join()
 
 
+def read_wav(path):
+    import soundfile as sf
+
+    audio, sr = sf.read(path, dtype="float32")
+    if audio.ndim > 1:
+        audio = audio[:, 0]
+    assert sr == SAMPLE_RATE, f"expected {SAMPLE_RATE} Hz wav, got {sr}"
+    return audio
+
+
+def record_wav(path):
+    import soundfile as sf
+
+    rec = Recorder()
+    input(f"press Enter to START recording {path} ... ")
+    rec.start()
+    input("recording — press Enter to STOP ... ")
+    audio = rec.stop()
+    sf.write(path, audio, SAMPLE_RATE)
+    print(f"saved {len(audio) / SAMPLE_RATE:.1f}s to {path}")
+
+
 def main():
     if len(sys.argv) == 3 and sys.argv[1] == "--test":
-        import soundfile as sf
-
         app = LocalFlow()
-        audio, sr = sf.read(sys.argv[2], dtype="float32")
-        if audio.ndim > 1:
-            audio = audio[:, 0]
-        assert sr == SAMPLE_RATE, f"expected {SAMPLE_RATE} Hz wav, got {sr}"
-        print(apply_dictionary(app.transcribe(audio), app.rules))
+        print(apply_dictionary(app.transcribe(read_wav(sys.argv[2])), app.rules))
+        return
+    if len(sys.argv) == 3 and sys.argv[1] == "--ab":
+        audio = read_wav(sys.argv[2])
+        rules = load_dictionary()
+        ensure_offline(MODEL, AB_MODEL)
+        for model in (MODEL, AB_MODEL):
+            engine = load_engine(model)
+            t0 = time.time()
+            text = apply_dictionary(engine(audio), rules)
+            print(f"{model.split('/')[-1]:>28} · {time.time() - t0:.1f}s · {text}")
+        return
+    if len(sys.argv) == 3 and sys.argv[1] == "--record":
+        record_wav(sys.argv[2])
         return
     try:
         LocalFlow().run()
