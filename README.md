@@ -14,7 +14,11 @@ speech model running on this Mac's GPU.
 ```
 hold Right-Option ──► mic capture (sounddevice, 16 kHz mono)
 release           ──► Whisper large-v3-turbo on Apple MLX (Metal GPU, on-device)
+                        (biased toward dictionary.json vocab via initial_prompt)
                   ──► custom dictionary fix-ups (dictionary.json)
+                  ──► LLM cleanup pass (llama3.2:3b via local Ollama):
+                        fixes mis-heard words from context, strips "um"s and
+                        false starts — skipped gracefully if Ollama is down
                   ──► clipboard + synthetic Cmd-V into the frontmost app
                         (old clipboard restored afterwards)
 ```
@@ -57,16 +61,49 @@ processing, text lands at your cursor ~1 s later.
 `.venv/bin/python localflow.py --test file.wav` transcribes a 16 kHz wav and
 prints instead of pasting (pipeline verification).
 
+## Run as a menu-bar app (no terminal)
+
+```sh
+./make_app.sh
+```
+
+builds **`~/Applications/LocalFlow.app`** — launch it from Spotlight or
+Finder like any app. No terminal window: a small ◌ appears in the menu bar,
+turning ◎ when the model is warm, with a **Quit localflow** menu item.
+Output goes to `~/Library/Logs/localflow.log`.
+
+macOS treats the bundle as a new app, so grant the same three permissions
+again — this time to **LocalFlow.app** (use **+** in each pane if it isn't
+listed), then relaunch. Re-run `make_app.sh` if you move this folder.
+
 To start it automatically at login: System Settings → General → Login Items
-→ **+** → add `LocalFlow.command`.
+→ **+** → add `LocalFlow.app` (or `LocalFlow.command` for the terminal
+version).
+
+## LLM cleanup pass (optional, recommended)
+
+A second on-device pass through a small LLM makes transcripts read the way
+you *meant* them: homophones fixed from context, fillers and false starts
+dropped, punctuation cleaned. Setup (free, local, ~2 GB once):
+
+```sh
+brew install ollama
+brew services start ollama     # keeps it running at login
+ollama pull llama3.2:3b
+```
+
+Costs ~0.5–1 s per dictation. If Ollama isn't running, localflow notices and
+pastes the raw transcript instead — dictation never blocks on it. Disable
+with `CLEANUP = False` in the config block.
 
 ## Config
 
 Constants at the top of `localflow.py`: hotkey, model, sounds, clipboard
-restore. `dictionary.json` maps misheard words to your spelling
-(case-insensitive whole-word), e.g. `"vwap": "VWAP"`.
+restore, cleanup. `dictionary.json` maps misheard words to your spelling
+(case-insensitive whole-word), e.g. `"vwap": "VWAP"` — entries also bias
+what Whisper hears in the first place.
 
 ## Not built (ideas, not promises)
 
-Menu-bar app instead of a terminal window · streaming partial transcripts ·
-tone/context rewriting via a local LLM (Ollama) · per-app formatting.
+Streaming partial transcripts · a learning loop that suggests dictionary
+entries from your transcript history · per-app formatting.

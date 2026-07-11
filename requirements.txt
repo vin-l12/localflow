@@ -2,3 +2,4 @@ mlx-whisper
 parakeet-mlx
 sounddevice
 pynput
+rumps
