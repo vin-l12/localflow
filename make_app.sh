@@ -7,6 +7,15 @@ APP="/Applications/LocalFlow.app"
 [ -w /Applications ] || APP="$HOME/Applications/LocalFlow.app"
 
 mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/Resources"
+
+# app icon: without LocalFlow.icns in Resources + CFBundleIconFile below,
+# macOS falls back to Python's default rocket. Regenerate art via make_icon.py.
+if [ -f "$REPO/LocalFlow.icns" ]; then
+    cp "$REPO/LocalFlow.icns" "$APP/Contents/Resources/LocalFlow.icns"
+else
+    echo "  (no LocalFlow.icns — run 'python3 make_icon.py' first for the app icon)"
+fi
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -18,6 +27,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleIdentifier</key>      <string>io.github.vin-l12.localflow</string>
     <key>CFBundleVersion</key>         <string>1.0</string>
     <key>CFBundleExecutable</key>      <string>LocalFlow</string>
+    <key>CFBundleIconFile</key>        <string>LocalFlow</string>
     <key>CFBundlePackageType</key>     <string>APPL</string>
     <key>LSUIElement</key>             <true/>
     <key>NSMicrophoneUsageDescription</key>

@@ -58,6 +58,12 @@ permissions, granted to **your terminal app** (Terminal/iTerm/etc):
 
 Then hold **Right Option**, speak, release. Quiet pop = recording, bottle =
 processing, text lands at your cursor ~1 s later.
+
+> Change the key via `HOTKEY` in `localflow.py` (`alt_r`, `cmd_r`, `ctrl_r`,
+> `f13`). Note: the Fn/Globe key is *not* supported — macOS sets the same
+> "function" modifier flag for the arrow and F-keys, so it can't be told apart
+> from them without a dedicated event tap.
+
 `.venv/bin/python localflow.py --test file.wav` transcribes a 16 kHz wav and
 prints instead of pasting (pipeline verification).
 

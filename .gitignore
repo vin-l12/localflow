@@ -3,3 +3,13 @@ __pycache__/
 .DS_Store
 *.wav
 *.aiff
+
+# Your voice and your vocabulary. Local, private, never pushed — this repo is
+# public. Delete either file any time; the lexicon rebuilds itself.
+dictations.log
+lexicon.json
+
+# icon build artifacts — LocalFlow.icns (committed) is the real output;
+# these are just intermediates from make_icon.py
+icon_preview.png
+LocalFlow.iconset/
