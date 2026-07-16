@@ -534,30 +534,137 @@ def paste_text(text):
             set_clipboard(old)
 
 
+# THE HANG. PortAudio on this mac does not only *fail* — it WEDGES: measured
+# Jul 16, Pa_StopStream simply never returned on the 13th rapid open/close
+# cycle (and Pa_OpenStream can do the same). A hang raises nothing, so no
+# try/except ever sees it; whichever thread made the call is gone. When that
+# thread was pynput's listener, the hotkey died and the mic stayed on — the
+# "stuck on recording" bug. The rule that fixes it for good: NO PortAudio call
+# may ever run on a thread we need back. Every open/close/reset below runs on
+# a disposable helper thread with a deadline; if PortAudio eats the thread, we
+# abandon it and move on — the next take opens a fresh stream.
+
+def _abandon(stream):
+    """abort+close on a sacrificial thread. abort(), not stop(): stop waits
+    for pending buffers inside CoreAudio (that is where it wedged); abort
+    discards them — and a dictation's frames are already collected by the
+    time this is called, so there is nothing left to wait FOR."""
+    def _close():
+        try:
+            stream.abort()
+            stream.close()
+        except Exception:
+            pass
+    t = threading.Thread(target=_close, daemon=True)
+    t.start()
+    t.join(2.0)
+    if t.is_alive():
+        print("  ⚠ audio close wedged — stream abandoned (the mic light may"
+              " linger); the next take opens a fresh one", flush=True)
+
+
+def reset_audio():
+    """Tear PortAudio down and back up, re-scanning the devices.
+
+    THE STALE-STATE WEDGE. After sleep-wake, long uptime, or a default-input
+    change (AirPods in/out), CoreAudio goes stale two ways: the open raises
+    -9986, or — worse — the stream "opens" fine and the callback never fires,
+    so a 15-second dictation comes back as zero frames and vanishes without a
+    sound. Restarting the app fixed both, because a fresh import re-initialises
+    PortAudio. This does the same WITHOUT the restart — on a helper thread,
+    because Pa_Terminate can hang like everything else here. Only call it with
+    no healthy stream open."""
+    outcome = {}
+    done = threading.Event()
+
+    def _reset():
+        try:
+            sd._terminate()
+            sd._initialize()
+            outcome["ok"] = True
+        except Exception as e:
+            print(f"  ⚠ audio engine reset failed ({type(e).__name__}: {e}) —"
+                  " if the mic stays dead, restart LocalFlow", flush=True)
+        done.set()
+
+    threading.Thread(target=_reset, daemon=True).start()
+    if not done.wait(3.0):
+        print("  ⚠ audio engine reset WEDGED — if the mic stays dead,"
+              " restart LocalFlow", flush=True)
+        return False
+    return outcome.get("ok", False)
+
+
 class Recorder:
     """Opens the mic only while the hotkey is held (no always-on orange dot)."""
 
     def __init__(self):
         self.frames = []
         self.stream = None
+        self.t0 = 0.0        # when the current take's mic opened (wall clock)
 
-    def start(self):
+    def start(self, timeout=1.5):
+        # The open runs on a helper thread with a deadline: Pa_OpenStream can
+        # WEDGE (see the block comment above _abandon), and this is called
+        # from pynput's listener thread — the one thread that must always
+        # come back. On timeout we raise for on_press to handle; if the
+        # stranded open eventually completes anyway, the helper sees it no
+        # longer owns the take and closes the stream back up.
         self.frames = []
-        self.stream = sd.InputStream(
-            samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-            callback=lambda data, *_: self.frames.append(data.copy()),
-        )
-        self.stream.start()
+        self.stream = None
+        frames = self.frames          # bind THIS take's list into the helper
+        box = {}
+        lock = threading.Lock()
+        done = threading.Event()
+
+        def _open():
+            try:
+                stream = sd.InputStream(
+                    samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+                    callback=lambda data, *_: frames.append(data.copy()),
+                )
+                stream.start()
+            except Exception as e:
+                box["error"] = e
+                done.set()
+                return
+            with lock:
+                late = box.get("late", False)
+                if not late:
+                    box["stream"] = stream
+            done.set()
+            if late:
+                _abandon(stream)      # opened after the caller gave up
+
+        threading.Thread(target=_open, daemon=True).start()
+        if not done.wait(timeout):
+            with lock:
+                if "stream" not in box:
+                    box["late"] = True
+                    raise RuntimeError(
+                        f"mic open timed out after {timeout}s (audio engine"
+                        " wedged)")
+        if "error" in box:
+            raise box["error"]
+        self.stream = box["stream"]
+        self.t0 = time.time()
 
     def stop(self):
-        if self.stream is None:
+        # Must NEVER raise and NEVER block: this runs on the pynput listener
+        # thread (via finish) and on the mic_guard thread. The take's audio is
+        # ALREADY in self.frames — snapshot it first, then hand the stream to
+        # _abandon; a wedged close costs a throwaway thread, never the take
+        # and never the hotkey.
+        stream, self.stream = self.stream, None
+        blocks = list(self.frames)
+        if stream is not None:
+            _abandon(stream)
+        if not blocks:
             return np.zeros(0, dtype=np.float32)
-        self.stream.stop()
-        self.stream.close()
-        self.stream = None
-        if not self.frames:
+        try:
+            return np.concatenate(blocks)[:, 0]
+        except Exception:
             return np.zeros(0, dtype=np.float32)
-        return np.concatenate(self.frames)[:, 0]
 
     def silent_tail(self, seconds, thresh=0.012):
         """True once the last `seconds` of the running take are below the
@@ -589,57 +696,82 @@ class LocalFlow:
     def worker(self):
         while True:
             audio, dur, t_end = self.jobs.get()
-            t0 = time.time()
+            # the whole job is guarded: this thread is the ONLY consumer of
+            # the queue, so an exception anywhere past this line (a paste
+            # hiccup, a log write) would otherwise kill it and every later
+            # dictation would vanish silently. One bad take may only cost
+            # that take.
             try:
-                text = self.transcribe(audio)
+                self._handle_take(audio, dur, t_end)
             except Exception as e:
-                print(f"  ⚠ transcription failed: {e}")
-                continue
-            if not text:
-                print("  (heard nothing)")
-                continue
-            # second net: the gate above stops silent takes, but Whisper will
-            # also hallucinate over breath, a cough, or a door — noise with
-            # real energy in it. Catch the artifact by name.
-            if is_hallucination(text, dur):
-                print(f"  (dropped a silence hallucination: {text!r})")
-                continue
-            # on a near-silent take Whisper echoes its vocabulary hint back —
-            # multiple words that ALL come from the dictionary is that echo,
-            # not speech
-            twords = re.findall(r"[a-z0-9'-]+", text.lower())
-            if len(twords) >= 2 and all(w in self.vocab_words for w in twords):
-                print(f"  (dropped a vocab echo from a near-silent take)")
-                continue
-            # physics guard: nobody speaks >6 words/sec — more words than the
-            # take could hold means the decoder looped (its known failure on
-            # repeated words), so collapse the repeats it invented
-            words = text.split()
-            if len(words) > dur * 6 + 5:
-                words = [w for i, w in enumerate(words)
-                         if i == 0 or w.lower() != words[i - 1].lower()]
-                text = " ".join(words)
-                print(f"  ⚠ decoder loop collapsed ({len(text.split())} of"
-                      f" the words survived a {dur:.0f}s take)")
-            text = apply_dictionary(text, self.rules)
-            # Log what Whisper HEARD, before any cleanup — the lexicon should
-            # learn the words you actually say, not the model's polish of them.
-            import lexicon
-            lexicon.log_dictation(text)
-            if CLEANUP:
-                try:
-                    # dictionary again after: the LLM must not undo spellings
-                    text = apply_dictionary(cleanup_text(text), self.rules)
-                except Exception as e:
-                    print(f"  ⚠ cleanup skipped ({e}) — pasting raw")
-            age = time.time() - t_end
-            if age > STALE_SECONDS:
-                # he pressed the key half a minute ago; whatever he's doing
-                # now, typing into it is worse than losing the take
-                print(f"  ⚠ dropped stale result ({age:.0f}s old): {text}")
-                continue
-            paste_text(text)
-            print(f"  {time.time() - t0:.1f}s · {text}")
+                print(f"  ⚠ take lost ({type(e).__name__}: {e}) — the worker"
+                      " lives on", flush=True)
+
+    def _handle_take(self, audio, dur, t_end):
+        t0 = time.time()
+        try:
+            text = self.transcribe(audio)
+        except Exception as e:
+            print(f"  ⚠ transcription failed: {e}")
+            return
+        if not text:
+            print("  (heard nothing)")
+            return
+        # second net: the gate above stops silent takes, but Whisper will
+        # also hallucinate over breath, a cough, or a door — noise with
+        # real energy in it. Catch the artifact by name.
+        if is_hallucination(text, dur):
+            print(f"  (dropped a silence hallucination: {text!r})")
+            return
+        # on a near-silent take Whisper echoes its vocabulary hint back —
+        # multiple words that ALL come from the dictionary is that echo,
+        # not speech
+        twords = re.findall(r"[a-z0-9'-]+", text.lower())
+        if len(twords) >= 2 and all(w in self.vocab_words for w in twords):
+            print(f"  (dropped a vocab echo from a near-silent take)")
+            return
+        # physics guard: nobody speaks >6 words/sec — more words than the
+        # take could hold means the decoder looped (its known failure on
+        # repeated words), so collapse the repeats it invented
+        words = text.split()
+        if len(words) > dur * 6 + 5:
+            words = [w for i, w in enumerate(words)
+                     if i == 0 or w.lower() != words[i - 1].lower()]
+            text = " ".join(words)
+            print(f"  ⚠ decoder loop collapsed ({len(text.split())} of"
+                  f" the words survived a {dur:.0f}s take)")
+        text = apply_dictionary(text, self.rules)
+        # Log what Whisper HEARD, before any cleanup — the lexicon should
+        # learn the words you actually say, not the model's polish of them.
+        import lexicon
+        lexicon.log_dictation(text)
+        if CLEANUP:
+            try:
+                # dictionary again after: the LLM must not undo spellings
+                text = apply_dictionary(cleanup_text(text), self.rules)
+            except Exception as e:
+                print(f"  ⚠ cleanup skipped ({e}) — pasting raw")
+        age = time.time() - t_end
+        if age > STALE_SECONDS:
+            # he pressed the key half a minute ago; whatever he's doing
+            # now, typing into it is worse than losing the take
+            print(f"  ⚠ dropped stale result ({age:.0f}s old): {text}")
+            return
+        # NEVER paste while the NEXT take is being held. The synthetic
+        # Cmd-V is posted with its flags forced to Command-only, and that
+        # OVERWRITES the session's modifier state — mic_guard, polling that
+        # very state, then reads the held hotkey as up and kills the take
+        # mid-hold (the 13:05 log trio: every "pasting anyway" while a key
+        # was down was followed by recording=False before the release).
+        # Waiting here does not make the result stale: he has been HOLDING
+        # the dictation key the whole time, so the target app is the same
+        # one this text was spoken for. mic_guard's MAX_SECONDS cap
+        # guarantees the wait ends even if his release event is lost.
+        deadline = time.time() + MAX_SECONDS + 5
+        while self.recording and time.time() < deadline:
+            time.sleep(0.05)
+        paste_text(text)
+        print(f"  {time.time() - t0:.1f}s · {text}")
 
     # -- hotkey handlers ----------------------------------------------------
     # macOS virtual keycodes for the hotkeys we support, so the guard below
@@ -674,12 +806,42 @@ class LocalFlow:
                   f" recording={self.recording}", flush=True)
 
     def on_press(self, key):
-        self.evlog("press", key)
-        if key == self.hotkey and not self.recording:
+        # This runs on pynput's listener thread. ANY exception that escapes it
+        # is fatal: pynput logs "Unhandled exception in listener callback" and
+        # STOPS the listener — after which the hotkey is dead until restart
+        # (the "press it and nothing happens, icon never turns on" symptom).
+        # So the whole body is guarded, and every failure resets state.
+        try:
+            self.evlog("press", key)
+            if key != self.hotkey or self.recording:
+                return
+            # Open the mic FIRST — only claim the recording state if it worked.
+            try:
+                self.recorder.start()
+            except Exception as e:
+                print(f"  ⚠ mic didn't open ({type(e).__name__}: {e}) —"
+                      " take dropped, try again", flush=True)
+                play("Basso")
+                # the -9986 wedge: without a reset every following press
+                # fails the same way until the app is restarted
+                reset_audio()
+                return
             self.recording = True
-            self.recorder.start()
-            threading.Thread(target=self.mic_guard, daemon=True).start()
+            try:
+                threading.Thread(target=self.mic_guard, daemon=True).start()
+            except Exception as e:
+                # No watchdog means nothing could ever end this take — so don't
+                # start one. Close the mic back up and reset.
+                print(f"  ⚠ watchdog didn't start ({type(e).__name__}: {e}) —"
+                      " take dropped", flush=True)
+                self.recording = False
+                self.recorder.stop()
+                return
             play("Pop")
+        except Exception as e:
+            self.recording = False
+            print(f"  ⚠ on_press recovered from {type(e).__name__}: {e}",
+                  flush=True)
 
     def mic_guard(self):
         """Stops the mic when the key is physically up even if the release
@@ -696,36 +858,60 @@ class LocalFlow:
         # kill every dictation half a second in
         armed = False
         t0 = time.time()
-        while self.recording and time.time() - t0 < MAX_SECONDS:
-            time.sleep(0.5)
-            down = any(
-                Quartz.CGEventSourceKeyState(src, keycode) for src in sources
-                if keycode is not None
-            ) or any(
-                Quartz.CGEventSourceFlagsState(src) & flagmask
-                for src in sources
-            )
-            if down:
-                armed = True
-            elif armed:
-                self.finish()
-                return
-            elif self.recorder.silent_tail(SILENCE_OFF):
-                # sensors are blind AND nobody has spoken for a while — the
-                # release was almost certainly missed; keep the spoken head
-                print(f"  ⚠ watchdog: {SILENCE_OFF}s of silence — ending the"
-                      " take (missed key-release?)")
-                self.finish()
-                return
+        # If the poll itself ever throws (Quartz hiccup after long uptime),
+        # this thread must still end the take — otherwise recording stays True
+        # with the mic open forever. So the whole loop is guarded, and every
+        # exit ends the take.
+        try:
+            while self.recording and time.time() - t0 < MAX_SECONDS:
+                time.sleep(0.5)
+                # a stream that has produced NOTHING 2.5s into a hold is the
+                # dead-mic wedge — end the take NOW (finish detects it, plays
+                # Basso and resets the engine) rather than letting him speak
+                # 15 more seconds into a mic that isn't listening
+                if time.time() - t0 > 2.5 and not self.recorder.frames:
+                    self.finish()
+                    return
+                down = any(
+                    Quartz.CGEventSourceKeyState(src, keycode) for src in sources
+                    if keycode is not None
+                ) or any(
+                    Quartz.CGEventSourceFlagsState(src) & flagmask
+                    for src in sources
+                )
+                if down:
+                    armed = True
+                elif armed:
+                    self.finish()
+                    return
+                elif self.recorder.silent_tail(SILENCE_OFF):
+                    # sensors are blind AND nobody has spoken for a while — the
+                    # release was almost certainly missed; keep the spoken head
+                    print(f"  ⚠ watchdog: {SILENCE_OFF}s of silence — ending the"
+                          " take (missed key-release?)")
+                    self.finish()
+                    return
+        except Exception as e:
+            print(f"  ⚠ mic_guard recovered from {type(e).__name__}: {e} —"
+                  " ending take", flush=True)
+            self.finish(discard=True)
+            return
         # the hard cap fired (or the sensors never armed): the release was
         # missed long ago, so the tail of this audio is desk noise — drop it
         # rather than paste a transcription of keyboard clatter
         self.finish(discard=True)
 
     def on_release(self, key):
-        self.evlog("release", key)
-        if key in self.release_keys and self.recording:
-            self.finish()
+        # Same listener thread as on_press — guard it the same way so a bad
+        # close can never silently kill hotkey delivery.
+        try:
+            self.evlog("release", key)
+            if key in self.release_keys and self.recording:
+                self.finish()
+        except Exception as e:
+            self.recording = False
+            print(f"  ⚠ on_release recovered from {type(e).__name__}: {e}",
+                  flush=True)
 
     def finish(self, discard=False):
         # both the release event and the mic guard call this — only one wins
@@ -740,6 +926,21 @@ class LocalFlow:
                   " audio (missed key-release, mic had run away)")
             return
         dur = len(audio) / SAMPLE_RATE
+        # THE SILENT DEATH. A held key with (almost) no audio behind it is not
+        # a graze — it is a wedged stream that opened fine and never called
+        # back. This used to fall through the dur<MIN gate below WITHOUT A
+        # WORD: 15s of speech gone, nothing in the log, and every later take
+        # equally dead until an app restart (the "stuck on recording" bug —
+        # it ended three sessions in a row on Jul 16). Call it out, reset the
+        # engine so the next press works, and tell him to say it again.
+        held = time.time() - self.recorder.t0 if self.recorder.t0 else 0.0
+        if held >= 2.0 and dur < held * 0.25:
+            print(f"  ⚠ mic went DEAD: key held {held:.0f}s but only"
+                  f" {dur:.1f}s of audio arrived — resetting the audio"
+                  " engine, please dictate that again", flush=True)
+            play("Basso")
+            reset_audio()
+            return
         if dur < MIN_SECONDS:
             return
         # THE SILENCE GATE. Held the key but said nothing? Then there is nothing
