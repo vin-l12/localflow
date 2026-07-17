@@ -2,7 +2,8 @@
 """
 localflow — private, fully-local voice dictation for macOS.
 
-Hold the hotkey (default: Right Option), speak, release.
+Hold the hotkey (default: Right Option), speak, release — or TAP it once to
+start, speak hands-free, and tap again to stop.
 Your words are transcribed on-device and pasted into whatever app has focus.
 No audio ever leaves this machine.
 
@@ -26,6 +27,23 @@ from pathlib import Path
 
 # ---------------------------------------------------------------- config ---
 HOTKEY = "alt_r"            # pynput key name: alt_r, cmd_r, ctrl_r, f13 ...
+TOGGLE_TAP = 0.4            # a press released quicker than this is a CLICK,
+                            # and a click now means click-to-toggle: tap to
+                            # start, speak hands-free, tap again to stop.
+                            # Before Jul 18 a tap opened the mic (orange dot!)
+                            # and then silently binned the take as a "graze" —
+                            # which read as "clicking it doesn't work at all"
+INPUT_DEVICE = "MacBook Pro Microphone"
+                            # pin the mic by name (substring, case-insensitive;
+                            # None/"" = system default). The default input is a
+                            # MOVING TARGET: the night of Jul 17 an iPhone
+                            # continuity mic ("Vin Microphone") took it over
+                            # mid-session and every take — restart included —
+                            # came back full-length but voiceless, because the
+                            # phone on the desk can't hear you at the Mac.
+                            # Nothing errors in that state, so nothing recovered.
+                            # If this name isn't found (other machine, renamed
+                            # device), the system default is used as before
 # Whisper stays the live engine. Parakeet v3 posts a better WER on the English
 # leaderboard and ~20x the throughput — but measured on THIS mac, on HIS words,
 # it was the same speed (2.2s vs 2.3s) and lost the jargon: "VWAP"->"voir",
@@ -595,6 +613,26 @@ def reset_audio():
     return outcome.get("ok", False)
 
 
+def _resolve_input():
+    """(device index, name) for the pinned input mic — or (None, default's
+    name) to use the system default.
+
+    Resolved by NAME on every open, never cached: which index the built-in
+    mic sits at changes as continuity devices come and go, and pinning by
+    name is the whole point — the system default follows those devices, and
+    a take recorded from an iPhone lying on the desk is full-length silence
+    with no error to catch (see INPUT_DEVICE)."""
+    try:
+        if INPUT_DEVICE:
+            for i, dev in enumerate(sd.query_devices()):
+                if dev["max_input_channels"] > 0 and \
+                        INPUT_DEVICE.lower() in dev["name"].lower():
+                    return i, dev["name"]
+        return None, sd.query_devices(kind="input")["name"]
+    except Exception:
+        return None, "?"
+
+
 class Recorder:
     """Opens the mic only while the hotkey is held (no always-on orange dot)."""
 
@@ -602,6 +640,7 @@ class Recorder:
         self.frames = []
         self.stream = None
         self.t0 = 0.0        # when the current take's mic opened (wall clock)
+        self.device_name = "?"   # which mic the current take records from
 
     def start(self, timeout=1.5):
         # The open runs on a helper thread with a deadline: Pa_OpenStream can
@@ -619,7 +658,9 @@ class Recorder:
 
         def _open():
             try:
+                device, name = _resolve_input()
                 stream = sd.InputStream(
+                    device=device,
                     samplerate=SAMPLE_RATE, channels=1, dtype="float32",
                     callback=lambda data, *_: frames.append(data.copy()),
                 )
@@ -632,6 +673,7 @@ class Recorder:
                 late = box.get("late", False)
                 if not late:
                     box["stream"] = stream
+                    box["device"] = name
             done.set()
             if late:
                 _abandon(stream)      # opened after the caller gave up
@@ -647,6 +689,7 @@ class Recorder:
         if "error" in box:
             raise box["error"]
         self.stream = box["stream"]
+        self.device_name = box.get("device", "?")
         self.t0 = time.time()
 
     def stop(self):
@@ -687,6 +730,7 @@ class LocalFlow:
         self.rules = load_dictionary()
         self.recorder = Recorder()
         self.recording = False
+        self.toggle_take = False   # True while a click-started take is open
         self.finish_lock = threading.Lock()
         self.vocab_words = set(
             re.findall(r"[a-z0-9'-]+", (vocab_prompt() or "").lower()))
@@ -813,7 +857,13 @@ class LocalFlow:
         # So the whole body is guarded, and every failure resets state.
         try:
             self.evlog("press", key)
-            if key != self.hotkey or self.recording:
+            if key != self.hotkey:
+                return
+            if self.recording:
+                # the second CLICK of a toggle take ends it; a re-press during
+                # a held take (impossible without a missed release) is ignored
+                if self.toggle_take:
+                    self.finish()
                 return
             # Open the mic FIRST — only claim the recording state if it worked.
             try:
@@ -826,6 +876,7 @@ class LocalFlow:
                 # fails the same way until the app is restarted
                 reset_audio()
                 return
+            self.toggle_take = False
             self.recording = True
             try:
                 threading.Thread(target=self.mic_guard, daemon=True).start()
@@ -872,6 +923,16 @@ class LocalFlow:
                 if time.time() - t0 > 2.5 and not self.recorder.frames:
                     self.finish()
                     return
+                if self.toggle_take:
+                    # click-to-toggle: no key is held, so the key sensors have
+                    # nothing to watch. The take ends on the next click, on a
+                    # long silence (he walked away mid-take), or at the cap.
+                    if self.recorder.silent_tail(SILENCE_OFF):
+                        print(f"  · toggle take: {SILENCE_OFF}s of silence —"
+                              " ending it", flush=True)
+                        self.finish()
+                        return
+                    continue
                 down = any(
                     Quartz.CGEventSourceKeyState(src, keycode) for src in sources
                     if keycode is not None
@@ -896,10 +957,12 @@ class LocalFlow:
                   " ending take", flush=True)
             self.finish(discard=True)
             return
-        # the hard cap fired (or the sensors never armed): the release was
-        # missed long ago, so the tail of this audio is desk noise — drop it
-        # rather than paste a transcription of keyboard clatter
-        self.finish(discard=True)
+        # the hard cap fired (or the sensors never armed): for a HELD take the
+        # release was missed long ago, so the tail is desk noise — drop it
+        # rather than paste a transcription of keyboard clatter. A toggle take
+        # that ran to the cap is different: he was dictating the whole time
+        # (silence would have ended it above), so transcribe what he said.
+        self.finish(discard=not self.toggle_take)
 
     def on_release(self, key):
         # Same listener thread as on_press — guard it the same way so a bad
@@ -907,6 +970,18 @@ class LocalFlow:
         try:
             self.evlog("release", key)
             if key in self.release_keys and self.recording:
+                held = (time.time() - self.recorder.t0
+                        if getattr(self.recorder, "t0", 0) else TOGGLE_TAP)
+                if held < TOGGLE_TAP:
+                    # a CLICK, not a hold: keep the take open (click-to-toggle)
+                    # — before this, the tap died at the MIN_SECONDS gate and
+                    # clicking looked entirely broken. Any duplicate release
+                    # inside the window is the same tap reported again.
+                    if not self.toggle_take:
+                        self.toggle_take = True
+                        print(f"  · toggle take — click {HOTKEY} again to"
+                              " stop", flush=True)
+                    return
                 self.finish()
         except Exception as e:
             self.recording = False
@@ -919,6 +994,7 @@ class LocalFlow:
             if not self.recording:
                 return
             self.recording = False
+            self.toggle_take = False
         audio = self.recorder.stop()
         play("Bottle")
         if discard:
@@ -946,7 +1022,20 @@ class LocalFlow:
         # THE SILENCE GATE. Held the key but said nothing? Then there is nothing
         # to transcribe, and asking anyway is how "Thank you." gets typed.
         if not is_speech(audio):
-            print(f"  (silent take, {dur:.1f}s — no voice in it)")
+            rms = float(np.sqrt((audio ** 2).mean())) if len(audio) else 0.0
+            print(f"  (silent take, {dur:.1f}s — no voice in it;"
+                  f" {self.recorder.device_name}, rms {rms:.4f})", flush=True)
+            # THE WRONG-MIC TRAP (Jul 17, 23:40). A LONG take with no voice in
+            # it usually isn't silence — it's a take recorded from a mic that
+            # can't hear you (a continuity iPhone/AirPods took the input while
+            # it was the default, or the device map went stale). Full-length
+            # frames arrive, so none of the missing-frames detectors fire, and
+            # without this reset every take stays voiceless until an app
+            # restart. The reset re-scans the devices so the next open finds
+            # the pinned mic again; on a take that really was you holding the
+            # key in silence it costs a no-op re-init and nothing else.
+            if dur >= 3.0:
+                reset_audio()
             return
         self.jobs.put((audio, dur, time.time()))
 

@@ -56,8 +56,14 @@ permissions, granted to **your terminal app** (Terminal/iTerm/etc):
 2. **Microphone** — prompted on your first dictation.
 3. **Accessibility** — to press Cmd-V for you (System Events prompt).
 
-Then hold **Right Option**, speak, release. Quiet pop = recording, bottle =
-processing, text lands at your cursor ~1 s later.
+Then hold **Right Option**, speak, release — or **tap it once** to start,
+speak hands-free, and tap again to stop (a take also ends itself after 10 s
+of silence). Quiet pop = recording, bottle = processing, text lands at your
+cursor ~1 s later.
+
+The mic is pinned by name (`INPUT_DEVICE` in the config block) rather than
+following the system default — otherwise an iPhone/AirPods continuity mic can
+silently take over the input and every dictation records the wrong room.
 
 > Change the key via `HOTKEY` in `localflow.py` (`alt_r`, `cmd_r`, `ctrl_r`,
 > `f13`). Note: the Fn/Globe key is *not* supported — macOS sets the same

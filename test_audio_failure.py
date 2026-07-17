@@ -34,6 +34,7 @@ def bare_app():
     loading the whisper model."""
     lf = localflow.LocalFlow.__new__(localflow.LocalFlow)
     lf.recording = False
+    lf.toggle_take = False
     lf.finish_lock = threading.Lock()
     lf.hotkey = HK
     lf.release_keys = {HK}
@@ -257,6 +258,114 @@ def test_paste_deferred_while_next_take_is_held():
     print("PASS: paste deferred until the open take closed")
 
 
+class GoodRecorder:
+    """A healthy take: 2 s of audio loud enough to pass the speech gate."""
+
+    def __init__(self):
+        import time
+        self.frames = [1]          # non-empty: the callback "fired"
+        self.t0 = time.time()
+        self.device_name = "test mic"
+
+    def start(self, timeout=1.5):
+        import time
+        self.t0 = time.time()
+
+    def stop(self):
+        return np.full(2 * localflow.SAMPLE_RATE, 0.1, dtype=np.float32)
+
+    def silent_tail(self, *_):
+        return False
+
+
+def test_tap_arms_toggle_and_second_click_stops():
+    """THE CLICK (Jul 18): a quick tap used to open the mic and silently drop
+    the take as a graze — clicking looked completely broken. A tap must now
+    ARM the take (click-to-toggle) and the next click must stop and queue it."""
+    lf = bare_app()
+    lf.recorder = GoodRecorder()
+    lf.on_press(HK)                       # click down
+    assert lf.recording, "press did not start a take"
+    lf.on_release(HK)                     # click up, well inside TOGGLE_TAP
+    assert lf.recording, "a quick tap must arm a toggle take, not drop it"
+    assert lf.toggle_take, "toggle flag not armed by the tap"
+    lf.on_press(HK)                       # second click ends the take
+    assert lf.recording is False, "second click did not stop the take"
+    assert not lf.jobs.empty(), "the toggle take never reached the transcriber"
+    print("PASS: tap arms toggle, second click stops and queues the take")
+
+
+def test_hold_release_still_finishes():
+    """Hold-to-dictate must keep working exactly as before."""
+    import time
+
+    lf = bare_app()
+    lf.recorder = GoodRecorder()
+    lf.on_press(HK)
+    lf.recorder.t0 = time.time() - 2      # the key was held for 2 s
+    lf.on_release(HK)
+    assert lf.recording is False
+    assert not lf.jobs.empty(), "a held take never reached the transcriber"
+    print("PASS: hold-release still finishes and queues the take")
+
+
+class WrongMicRecorder:
+    """THE DEVICE ROULETTE (Jul 17 23:40): the take records fine — full
+    duration, frames arriving — but from a mic that can't hear you (an iPhone
+    continuity mic on the desk), so the audio is voiceless end to end."""
+
+    def __init__(self):
+        import time
+        self.t0 = time.time() - 5
+        self.frames = [1]
+        self.device_name = "Vin Microphone"
+
+    def stop(self):
+        return np.zeros(5 * localflow.SAMPLE_RATE, dtype=np.float32)
+
+
+def test_voiceless_long_take_resets_audio():
+    """A long take with no voice in it must reset the audio engine (fresh
+    device scan) — that is the ONLY way the app ever escapes recording from
+    the wrong mic without a restart. Every existing detector keys on missing
+    frames and stays blind to this."""
+    lf = bare_app()
+    lf.recorder = WrongMicRecorder()
+    lf.recording = True
+
+    resets = []
+    localflow.reset_audio = lambda: resets.append(1) or True
+
+    lf.on_release(HK)
+    assert lf.recording is False
+    assert lf.jobs.empty(), "a voiceless take must not reach the transcriber"
+    assert resets, ("a long voiceless take must reset the audio engine — "
+                    "without it every take keeps coming from the wrong mic "
+                    "until an app restart")
+    print("PASS: voiceless long take triggers an audio engine reset")
+
+
+def test_input_device_pinned_by_name():
+    """The mic must be picked by NAME, not by 'system default' — the default
+    is a moving target that continuity devices steal."""
+    fake = [
+        {"name": "Vin Microphone", "max_input_channels": 1},
+        {"name": "MacBook Pro Microphone", "max_input_channels": 1},
+    ]
+    real = localflow.sd.query_devices
+    localflow.sd.query_devices = lambda *a, **k: fake
+    old = localflow.INPUT_DEVICE
+    localflow.INPUT_DEVICE = "MacBook Pro Microphone"
+    try:
+        idx, name = localflow._resolve_input()
+        assert idx == 1 and "MacBook" in name, (
+            f"expected the built-in mic, got {idx} {name!r}")
+    finally:
+        localflow.sd.query_devices = real
+        localflow.INPUT_DEVICE = old
+    print("PASS: input device resolved by name, continuity mic skipped")
+
+
 if __name__ == "__main__":
     try:
         test_failed_start_does_not_stick_or_propagate()
@@ -267,6 +376,10 @@ if __name__ == "__main__":
         test_failed_open_resets_audio_for_the_next_press()
         test_worker_survives_a_paste_crash()
         test_paste_deferred_while_next_take_is_held()
+        test_tap_arms_toggle_and_second_click_stops()
+        test_hold_release_still_finishes()
+        test_voiceless_long_take_resets_audio()
+        test_input_device_pinned_by_name()
     except BaseException as e:
         print(f"FAIL: {type(e).__name__}: {e}")
         sys.exit(1)
